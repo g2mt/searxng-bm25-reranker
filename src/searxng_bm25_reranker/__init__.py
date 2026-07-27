@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import typing as t
 
+import searx
 from searx.plugins import Plugin, PluginInfo  # ty: ignore[unresolved-import]
 
 from ._tokenizer import cjk_tokenize
@@ -182,6 +183,7 @@ class SXNGPlugin(Plugin):
 
     def __init__(self, plg_cfg: PluginCfg) -> None:
         super().__init__(plg_cfg)
+        self._settings_prefix: str = self.id  # reads from searx.settings["bm25_reranker"]
         self.info = PluginInfo(
             id=self.id,
             name="BM25 Reranker",
@@ -232,13 +234,14 @@ class SXNGPlugin(Plugin):
         bm25_results = _compute_bm25_ranking(query, results)
 
         # ---- LM embedding ranking (only when lm_weight > 0) ---------------
-        lm_weight: float = float(self.plg_cfg.get("lm_weight", 0))
+        cfg = searx.settings.get(self._settings_prefix, {})
+        lm_weight: float = float(cfg.get("lm_weight", 0))
         lm_results: list[SparseResult] | None = None
         if lm_weight > 0:
-            lm_host: str = str(self.plg_cfg.get("lm_host", ""))
+            lm_host: str = str(cfg.get("lm_host", ""))
             if lm_host:
-                lm_query_prefix: str = str(self.plg_cfg.get("lm_query_prefix", ""))
-                lm_doc_prefix: str = str(self.plg_cfg.get("lm_doc_prefix", ""))
+                lm_query_prefix: str = str(cfg.get("lm_query_prefix", ""))
+                lm_doc_prefix: str = str(cfg.get("lm_doc_prefix", ""))
                 lm_results = _compute_lm_embedding_ranking(
                     query,
                     results,
@@ -265,7 +268,7 @@ class SXNGPlugin(Plugin):
         ]
 
         # ---- Weighted RRF fusion ------------------------------------------
-        bm25_weight: float = float(self.plg_cfg.get("bm25_weight", 1.0))
+        bm25_weight: float = float(cfg.get("bm25_weight", 1.0))
         result_lists: list[list[SparseResult]] = [engine_ranking]
         rrf_weights: list[float] = [1.0]
 

@@ -24,6 +24,154 @@ __version__ = "0.1.0"
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Standalone ranking functions
+# ---------------------------------------------------------------------------
+
+
+def _compute_bm25_ranking(
+    query: str,
+    results: list[t.Any],
+    *,
+    field_weights: dict[str, float] | None = None,
+) -> list[SparseResult] | None:
+    """Compute BM25F ranking for search results.
+
+    Builds a temporary BM25F index from result title+content fields and
+    retrieves the top results matching *query*.  The returned list can be
+    passed directly to :func:`rrf` for fusion with other rankings.
+
+    Args:
+        query: Original search query.
+        results: List of result objects (supporting ``[]`` access for
+            ``"title"`` and ``"content"``).
+        field_weights: Optional BM25F field weights.  Defaults to
+            ``{"title": 2.0, "content": 1.0}``.
+
+    Returns:
+        List of :class:`SparseResult` sorted by descending BM25 score,
+        or ``None`` when fewer than two results have usable text.
+    """
+    if field_weights is None:
+        field_weights = {"title": 2.0, "content": 1.0}
+
+    idx = SparseIndex(
+        variant="bm25",
+        field_weights=field_weights,
+        tokenize=cjk_tokenize,
+    )
+
+    valid_indices: list[int] = []
+    for i, r in enumerate(results):
+        title = _get_text(r, "title")
+        content = _get_text(r, "content")
+        if not title and not content:
+            continue
+        idx.add(str(i), {"title": title, "content": content})
+        valid_indices.append(i)
+
+    if len(valid_indices) < 2:
+        return None
+
+    return idx.search(query, top_k=len(valid_indices))
+
+
+def _compute_lm_embedding_ranking(
+    query: str,
+    results: list[t.Any],
+    *,
+    lm_host: str,
+) -> list[SparseResult] | None:
+    """Compute embedding-similarity ranking via an OpenAI-compatible API.
+
+    Sends *query* and the text of each result to the embedding endpoint,
+    then ranks results by cosine similarity to the query embedding.
+    The returned list can be passed directly to :func:`rrf` for fusion.
+
+    Args:
+        query: Original search query.
+        results: List of result objects (supporting ``[]`` access for
+            ``"title"`` and ``"content"``).
+        lm_host: Base URL of the embedding API (e.g. ``http://localhost:11434``).
+            The endpoint ``{lm_host}/v1/embeddings`` is called.
+
+    Returns:
+        List of :class:`SparseResult` sorted by descending cosine
+        similarity, or ``None`` on failure / insufficient results.
+    """
+    # Collect texts: query first, then result title+content pairs
+    texts: list[str] = [query]
+    valid_indices: list[int] = []
+    for i, r in enumerate(results):
+        title = _get_text(r, "title")
+        content = _get_text(r, "content")
+        text = f"{title}\n{content}".strip()
+        if text:
+            texts.append(text)
+            valid_indices.append(i)
+
+    if len(valid_indices) < 2:
+        return None
+
+    import math
+
+    # Obtain embeddings from the API
+    try:
+        embeddings = _fetch_embeddings(lm_host, texts)
+    except Exception:
+        logger.exception("LM embedding API call failed")
+        return None
+
+    if embeddings is None or len(embeddings) != len(texts):
+        logger.warning(
+            "Embedding API returned %d vectors, expected %d",
+            len(embeddings) if embeddings else 0,
+            len(texts),
+        )
+        return None
+
+    query_emb = embeddings[0]
+    result_embs = embeddings[1:]
+
+    # Rank by cosine similarity
+    scored: list[SparseResult] = []
+    for idx, emb in enumerate(result_embs):
+        dot = sum(a * b for a, b in zip(query_emb, emb))
+        norm_q = math.sqrt(sum(a * a for a in query_emb))
+        norm_e = math.sqrt(sum(b * b for b in emb))
+        sim = dot / (norm_q * norm_e) if norm_q and norm_e else 0.0
+        scored.append(SparseResult(doc_id=str(valid_indices[idx]), score=sim))
+
+    scored.sort(key=lambda r: r.score, reverse=True)
+    return scored
+
+
+# ---------------------------------------------------------------------------
+# Helpers for the embedding pipeline
+# ---------------------------------------------------------------------------
+
+
+def _fetch_embeddings(host: str, texts: list[str]) -> list[list[float]] | None:
+    """Call an OpenAI-compatible ``/v1/embeddings`` endpoint."""
+    import json
+    import urllib.request
+
+    url = f"{host.rstrip('/')}/v1/embeddings"
+    payload = json.dumps({"model": "default", "input": texts}).encode("utf-8")
+
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        body = json.loads(resp.read().decode("utf-8"))
+
+    # OpenAI shape: {"data": [{"embedding": [...], "index": 0}, ...]}
+    items = sorted(body["data"], key=lambda e: e["index"])
+    return [e["embedding"] for e in items]
+
 
 class SXNGPlugin(Plugin):
     """Rerank search results using BM25 scoring with RRF fusion."""
@@ -68,44 +216,62 @@ class SXNGPlugin(Plugin):
     def _rerank(self, query: str, results_map: dict) -> None:
         """Core reranking logic.
 
+        Combines the original engine ranking with BM25 text relevance and
+        optionally LM embedding similarity via weighted RRF (Reciprocal
+        Rank Fusion).
+
         Args:
             query: Original search query.
             results_map: Dict of result hash -> MainResult/LegacyResult objects.
         """
         results = list(results_map.values())
 
-        # Build temporary BM25F index with title boost
-        idx = SparseIndex(
-            variant="bm25",
-            field_weights={"title": 2.0, "content": 1.0},
-            tokenize=cjk_tokenize,
-        )
+        # ---- BM25 ranking -------------------------------------------------
+        bm25_results = _compute_bm25_ranking(query, results)
 
+        # ---- LM embedding ranking (only when lm_weight > 0) ---------------
+        lm_weight: float = float(self.plg_cfg.get("lm_weight", 0))
+        lm_results: list[SparseResult] | None = None
+        if lm_weight > 0:
+            lm_host: str = str(self.plg_cfg.get("lm_host", ""))
+            if lm_host:
+                lm_results = _compute_lm_embedding_ranking(
+                    query, results, lm_host=lm_host
+                )
+
+        # ---- Determine valid indices (results with usable text) -----------
         valid_indices: list[int] = []
         for i, r in enumerate(results):
             title = _get_text(r, "title")
             content = _get_text(r, "content")
-            if not title and not content:
-                continue
-            idx.add(str(i), {"title": title, "content": content})
-            valid_indices.append(i)
+            if title or content:
+                valid_indices.append(i)
 
         if len(valid_indices) < 2:
             return
 
-        # BM25 retrieval
-        bm25_results = idx.search(query, top_k=len(valid_indices))
-
-        # Build engine ranking from original positions
-        engine_ranking = [
+        # ---- Engine ranking (original positions → reciprocal scores) ------
+        engine_ranking: list[SparseResult] = [
             SparseResult(doc_id=str(i), score=1.0 / (rank + 1))
             for rank, i in enumerate(valid_indices)
         ]
 
-        # RRF fusion: combine engine ranking + BM25 ranking
-        fused = rrf(engine_ranking, bm25_results, k=60)
+        # ---- Weighted RRF fusion ------------------------------------------
+        bm25_weight: float = float(self.plg_cfg.get("bm25_weight", 1.0))
+        result_lists: list[list[SparseResult]] = [engine_ranking]
+        rrf_weights: list[float] = [1.0]
 
-        # Rewrite positions to influence calculate_score()
+        if bm25_results:
+            result_lists.append(bm25_results)
+            rrf_weights.append(bm25_weight)
+
+        if lm_results:
+            result_lists.append(lm_results)
+            rrf_weights.append(lm_weight)
+
+        fused = rrf(*result_lists, k=60, weights=rrf_weights)
+
+        # ---- Rewrite positions to influence calculate_score() -------------
         for new_pos, fused_r in enumerate(fused, start=1):
             idx_int = int(fused_r.doc_id)
             r = results[idx_int]
@@ -113,7 +279,13 @@ class SXNGPlugin(Plugin):
             n_positions = len(r["positions"]) if r["positions"] else 1
             r["positions"] = [new_pos] * max(n_positions, 1)
 
-        logger.debug("BM25 reranked %d results for query: %s", len(fused), query[:50])
+        logger.debug(
+            "Reranked %d results (bm25_weight=%.2f, lm_weight=%.2f) for: %s",
+            len(fused),
+            bm25_weight,
+            lm_weight,
+            query[:50],
+        )
 
 
 def _get_text(result: t.Any, field: str) -> str:

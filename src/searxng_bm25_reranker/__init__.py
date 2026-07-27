@@ -20,6 +20,8 @@ if t.TYPE_CHECKING:
     from searx.plugins import PluginCfg  # ty: ignore[unresolved-import]
     from searx.search import SearchWithPlugins  # ty: ignore[unresolved-import]
 
+import math
+
 __version__ = "0.1.0"
 
 logger = logging.getLogger(__name__)
@@ -81,6 +83,8 @@ def _compute_lm_embedding_ranking(
     results: list[t.Any],
     *,
     lm_host: str,
+    lm_query_prefix: str = "",
+    lm_doc_prefix: str = "",
 ) -> list[SparseResult] | None:
     """Compute embedding-similarity ranking via an OpenAI-compatible API.
 
@@ -100,20 +104,18 @@ def _compute_lm_embedding_ranking(
         similarity, or ``None`` on failure / insufficient results.
     """
     # Collect texts: query first, then result title+content pairs
-    texts: list[str] = [query]
+    texts: list[str] = [f"{lm_query_prefix}{query}".strip()]
     valid_indices: list[int] = []
     for i, r in enumerate(results):
         title = _get_text(r, "title")
         content = _get_text(r, "content")
-        text = f"{title}\n{content}".strip()
+        text = f"{lm_doc_prefix}{title}\n{content}".strip()
         if text:
             texts.append(text)
             valid_indices.append(i)
 
     if len(valid_indices) < 2:
         return None
-
-    import math
 
     # Obtain embeddings from the API
     try:
@@ -235,8 +237,14 @@ class SXNGPlugin(Plugin):
         if lm_weight > 0:
             lm_host: str = str(self.plg_cfg.get("lm_host", ""))
             if lm_host:
+                lm_query_prefix: str = str(self.plg_cfg.get("lm_query_prefix", ""))
+                lm_doc_prefix: str = str(self.plg_cfg.get("lm_doc_prefix", ""))
                 lm_results = _compute_lm_embedding_ranking(
-                    query, results, lm_host=lm_host
+                    query,
+                    results,
+                    lm_host=lm_host,
+                    lm_query_prefix=lm_query_prefix,
+                    lm_doc_prefix=lm_doc_prefix,
                 )
 
         # ---- Determine valid indices (results with usable text) -----------

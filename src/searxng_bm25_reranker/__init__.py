@@ -109,8 +109,9 @@ def _compute_lm_embedding_ranking(
     valid_indices: list[int] = []
     for i, r in enumerate(results):
         title = _get_text(r, "title")
+        url = _get_text(r, "url")
         content = _get_text(r, "content")
-        text = f"{lm_doc_prefix}{title}\n{content}".strip()
+        text = f"{lm_doc_prefix}{title} {url}\n{content}".strip()
         if text:
             texts.append(text)
             valid_indices.append(i)

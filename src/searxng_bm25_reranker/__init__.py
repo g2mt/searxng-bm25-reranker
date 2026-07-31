@@ -23,6 +23,7 @@ if t.TYPE_CHECKING:
     from searx.search import SearchWithPlugins  # ty: ignore[unresolved-import]
 
 import math
+import urllib.parse
 
 __version__ = "0.1.0"
 
@@ -113,7 +114,9 @@ def _compute_lm_embedding_ranking(
     for i, r in enumerate(results):
         title = _get_text(r, "title")
         content = _get_text(r, "content")
-        text = _truncate_tokens(f"{lm_doc_prefix}{title}\n{content}".strip())
+        url = _get_text(r, "url")
+        host = _url_host(url)
+        text = _truncate_tokens(f"{lm_doc_prefix}{title} {host}\n{content}".strip())
         if text:
             texts.append(text)
             valid_indices.append(i)
@@ -158,6 +161,14 @@ def _compute_lm_embedding_ranking(
 
 
 _SPACE_RE = re.compile(r"[ \t]+")
+
+
+def _url_host(url: str) -> str:
+    """Extract the hostname from a URL, without scheme, path, or port."""
+    try:
+        return urllib.parse.urlparse(url).hostname or ""
+    except ValueError:
+        return ""
 
 
 def _truncate_tokens(text: str, max_tokens: int = 512) -> str:

@@ -7,12 +7,13 @@ by text relevance, with RRF fusion to preserve engine ranking signals.
 from __future__ import annotations
 
 import logging
+import re
 import typing as t
 
 import searx
 from searx.plugins import Plugin, PluginInfo  # ty: ignore[unresolved-import]
 
-from ._tokenizer import cjk_tokenize
+from ._tokenizer import _has_cjk, cjk_tokenize
 from ._vendor.sparse_search import Result as SparseResult
 from ._vendor.sparse_search import SparseIndex, rrf
 
@@ -91,6 +92,7 @@ def _compute_lm_embedding_ranking(
 
     Sends *query* and the text of each result to the embedding endpoint,
     then ranks results by cosine similarity to the query embedding.
+    Documents are truncated to roughly 512 tokens before embedding.
     The returned list can be passed directly to :func:`rrf` for fusion.
 
     Args:
@@ -105,13 +107,13 @@ def _compute_lm_embedding_ranking(
         similarity, or ``None`` on failure / insufficient results.
     """
     # Collect texts: query first, then result title+content pairs
-    texts: list[str] = [f"{lm_query_prefix}{query}".strip()]
+    # (documents truncated to ~512 tokens to bound payload size)
+    texts: list[str] = [_truncate_tokens(f"{lm_query_prefix}{query}".strip())]
     valid_indices: list[int] = []
     for i, r in enumerate(results):
         title = _get_text(r, "title")
-        url = _get_text(r, "url")
         content = _get_text(r, "content")
-        text = f"{lm_doc_prefix}{title} {url}\n{content}".strip()
+        text = _truncate_tokens(f"{lm_doc_prefix}{title}\n{content}".strip())
         if text:
             texts.append(text)
             valid_indices.append(i)
@@ -153,6 +155,36 @@ def _compute_lm_embedding_ranking(
 # ---------------------------------------------------------------------------
 # Helpers for the embedding pipeline
 # ---------------------------------------------------------------------------
+
+
+_SPACE_RE = re.compile(r"[ \t]+")
+
+
+def _truncate_tokens(text: str, max_tokens: int = 512) -> str:
+    """Normalize and truncate text to roughly *max_tokens* tokens.
+
+    Runs of spaces/tabs are collapsed to a single space, then the text is
+    cut down using a lightweight heuristic (about 4 characters per token
+    for Latin text, 1 character per token for CJK) so the full text never
+    needs to be tokenized.  The cut lands on the nearest whitespace
+    boundary to avoid splitting mid-word.
+    """
+    if not text:
+        return text
+
+    text = _SPACE_RE.sub(" ", text)
+
+    # CJK text is roughly 1 token per character; Latin ~4 chars per token
+    budget = max_tokens if _has_cjk(text) else max_tokens * 4
+    if len(text) <= budget:
+        return text
+
+    cut = text[:budget]
+    # Prefer a whitespace boundary so we don't split mid-word
+    ws = max(cut.rfind(" "), cut.rfind("\n"), cut.rfind("\t"))
+    if ws > budget // 2:
+        cut = cut[:ws]
+    return cut
 
 
 def _fetch_embeddings(host: str, texts: list[str]) -> list[list[float]] | None:

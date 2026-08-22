@@ -272,6 +272,18 @@ class SXNGPlugin(Plugin):
             query: Original search query.
             results_map: Dict of result hash -> MainResult/LegacyResult objects.
         """
+        # Discard results that do not contain any query word in their title
+        # or description before applying any ranking.  Keeping these results
+        # in the engine ranking would allow them to survive RRF even though
+        # they are not textually relevant.
+        query_words = set(cjk_tokenize(query))
+        for result_id, result in list(results_map.items()):
+            if not _result_matches_query(result, query_words):
+                del results_map[result_id]
+
+        if len(results_map) < 2:
+            return
+
         results = list(results_map.values())
 
         # ---- BM25 ranking -------------------------------------------------
@@ -350,3 +362,16 @@ def _get_text(result: t.Any, field: str) -> str:
     except (KeyError, TypeError):
         val = getattr(result, field, "")
     return val or ""
+
+
+def _result_matches_query(result: t.Any, query_words: set[str]) -> bool:
+    """Return whether a result title or description contains a query word."""
+    if not query_words:
+        return False
+
+    title = _get_text(result, "title")
+    description = _get_text(result, "description") or _get_text(result, "content")
+    return any(
+        token in query_words
+        for token in cjk_tokenize(f"{title} {description}")
+    )

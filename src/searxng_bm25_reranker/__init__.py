@@ -338,6 +338,12 @@ class SXNGPlugin(Plugin):
 
         fused = rrf(*result_lists, k=60, weights=rrf_weights)
 
+        # ---- URL priority: apply per-URL weight multipliers ---------------
+        # Applied after all ranking (BM25 / LM / RRF fusion) is done; the
+        # multiplied scores decide the final order rewritten below.
+        url_priority: dict = cfg.get("url_priority") or {}
+        fused = _apply_url_priority(fused, results, url_priority)
+
         # ---- Rewrite positions to influence calculate_score() -------------
         for new_pos, fused_r in enumerate(fused, start=1):
             idx_int = int(fused_r.doc_id)
@@ -347,12 +353,81 @@ class SXNGPlugin(Plugin):
             r["positions"] = [new_pos] * max(n_positions, 1)
 
         logger.debug(
-            "Reranked %d results (bm25_weight=%.2f, lm_weight=%.2f) for: %s",
+            "Reranked %d results (bm25_weight=%.2f, lm_weight=%.2f, url_priority=%d patterns) for: %s",
             len(fused),
             bm25_weight,
             lm_weight,
+            len(url_priority),
             query[:50],
         )
+
+
+def _apply_url_priority(
+    fused: list[SparseResult],
+    results: list[t.Any],
+    url_priority: t.Mapping[str, t.Any] | None,
+) -> list[SparseResult]:
+    """Apply per-URL weight multipliers on top of the fused ranking.
+
+    *url_priority* maps a regex pattern (matched against each result's URL)
+    to a float weight multiplier.  Every result whose URL matches a pattern
+    has its fused score multiplied by the corresponding multiplier; when
+    several patterns match, all multipliers are applied.  The adjusted
+    ranking is re-sorted and returned, so the multipliers take effect
+    *after* all other ranking (BM25 / LM / RRF fusion) is done.
+
+    Args:
+        fused: RRF-fused ranking (each ``doc_id`` indexes *results*).
+        results: List of result objects (supporting ``[]`` access for
+            ``"url"``).
+        url_priority: Mapping of regex string -> weight multiplier, or
+            ``None``/empty to leave the ranking unchanged.
+
+    Returns:
+        A new list of :class:`SparseResult` sorted by descending
+        (fused score x matched URL multipliers).
+    """
+    if not url_priority:
+        return fused
+
+    # Compile the patterns once per request; drop invalid entries.
+    patterns: list[tuple[re.Pattern[str], float]] = []
+    for pattern, multiplier in url_priority.items():
+        try:
+            multiplier = float(multiplier)
+        except (TypeError, ValueError):
+            logger.warning(
+                "url_priority: ignoring non-numeric multiplier %r for %r", multiplier, pattern
+            )
+            continue
+        if multiplier <= 0:
+            logger.warning(
+                "url_priority: ignoring non-positive multiplier %r for %r", multiplier, pattern
+            )
+            continue
+        try:
+            patterns.append((re.compile(pattern), multiplier))
+        except re.error:
+            logger.warning("url_priority: ignoring invalid regex %r", pattern)
+
+    if not patterns:
+        return fused
+
+    adjusted: list[SparseResult] = []
+    for fused_r in fused:
+        r = results[int(fused_r.doc_id)]
+        url = _get_text(r, "url")
+        multiplier = 1.0
+        if url:
+            for regex, m in patterns:
+                if regex.search(url):
+                    multiplier *= m
+        adjusted.append(
+            SparseResult(doc_id=fused_r.doc_id, score=fused_r.score * multiplier)
+        )
+
+    adjusted.sort(key=lambda r: r.score, reverse=True)
+    return adjusted
 
 
 def _get_text(result: t.Any, field: str) -> str:

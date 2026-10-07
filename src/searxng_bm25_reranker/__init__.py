@@ -360,6 +360,13 @@ class SXNGPlugin(Plugin):
         url_priority: dict = cfg.get("url_priority") or {}
         fused = _apply_url_priority(fused, results, url_priority)
 
+        # ---- Date-based score adjustments ---------------------------------
+        lm_date_boost = cfg.get("lm_date_boost", 1.0)
+        lm_date_nerf = cfg.get("lm_date_nerf", 1.0)
+        fused = _apply_lm_date_adjustments(
+            fused, results, lm_date_boost=lm_date_boost, lm_date_nerf=lm_date_nerf
+        )
+
         # ---- Rewrite positions to influence calculate_score() -------------
         for new_pos, fused_r in enumerate(fused, start=1):
             idx_int = int(fused_r.doc_id)
@@ -369,13 +376,60 @@ class SXNGPlugin(Plugin):
             r["positions"] = [new_pos] * max(n_positions, 1)
 
         logger.debug(
-            "Reranked %d results (bm25_weight=%.2f, lm_weight=%.2f, url_priority=%d patterns) for: %s",
+            "Reranked %d results (bm25_weight=%.2f, lm_weight=%.2f, url_priority=%d patterns, lm_date_boost=%s, lm_date_nerf=%s) for: %s",
             len(fused),
             bm25_weight,
             lm_weight,
             len(url_priority),
+            lm_date_boost,
+            lm_date_nerf,
             query[:50],
         )
+
+
+def _apply_lm_date_adjustments(
+    fused: list[SparseResult],
+    results: list[t.Any],
+    *,
+    lm_date_boost: t.Any = 1.0,
+    lm_date_nerf: t.Any = 1.0,
+) -> list[SparseResult]:
+    """Adjust fused scores by publication year.
+
+    Results published before 2022 are multiplied by *lm_date_boost*;
+    results published after 2022 are multiplied by *lm_date_nerf*. Results
+    from 2022 or without a usable publication date are left unchanged.
+    """
+    try:
+        boost = float(lm_date_boost)
+    except (TypeError, ValueError):
+        logger.warning("lm_date_boost: ignoring non-numeric factor %r", lm_date_boost)
+        boost = 1.0
+
+    try:
+        nerf = float(lm_date_nerf)
+    except (TypeError, ValueError):
+        logger.warning("lm_date_nerf: ignoring non-numeric factor %r", lm_date_nerf)
+        nerf = 1.0
+
+    adjusted: list[SparseResult] = []
+    for fused_r in fused:
+        result = results[int(fused_r.doc_id)]
+        published_date = _get_value(result, "publishedDate")
+        year = getattr(published_date, "year", None)
+        if year is None and published_date:
+            year_match = re.search(r"\b(\d{4})\b", str(published_date))
+            year = int(year_match.group(1)) if year_match else None
+
+        multiplier = boost if year is not None and year < 2022 else 1.0
+        if year is not None and year > 2022:
+            multiplier = nerf
+        adjusted.append(
+            SparseResult(doc_id=fused_r.doc_id, score=fused_r.score * multiplier)
+        )
+
+    adjusted.sort(key=lambda r: r.score, reverse=True)
+    return adjusted
 
 
 def _apply_url_priority(
@@ -446,13 +500,17 @@ def _apply_url_priority(
     return adjusted
 
 
+def _get_value(result: t.Any, field: str) -> t.Any:
+    """Safely extract a field from a result object supporting [] access."""
+    try:
+        return result[field]
+    except (KeyError, TypeError):
+        return getattr(result, field, None)
+
+
 def _get_text(result: t.Any, field: str) -> str:
     """Safely extract text field from a result object supporting [] access."""
-    try:
-        val = result[field]
-    except (KeyError, TypeError):
-        val = getattr(result, field, "")
-    return val or ""
+    return _get_value(result, field) or ""
 
 
 def _result_matches_query(result: t.Any, query_words: set[str]) -> bool:

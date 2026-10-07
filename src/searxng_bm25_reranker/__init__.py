@@ -265,15 +265,16 @@ class SXNGPlugin(Plugin):
 
     def _filter_results(self, query: str, results_map: dict) -> None:
         """Remove mostly non-Latin results for queries containing ASCII Latin letters."""
+
+        def is_latin_character(char: str) -> bool:
+            return char.isascii() or unicodedata.name(char, "").startswith("LATIN ")
+
         if not re.search(r"[A-Za-z]", query):
             return
 
         for result_id, result in list(results_map.items()):
-            title = _get_text(result, "title")
-            description = _get_text(result, "description") or _get_text(result, "content")
-            text = f"{title} {description}"
-            letters = [char for char in text if char.isalpha()]
-            if letters and sum(not _is_latin_letter(char) for char in letters) / len(letters) >= 0.6:
+            text = _get_text(result, "description") or _get_text(result, "title")
+            if text and sum(not is_latin_character(char) for char in text) / len(text) > 0.6:
                 del results_map[result_id]
 
     def _rerank(self, query: str, results_map: dict) -> None:
@@ -443,11 +444,6 @@ def _apply_url_priority(
 
     adjusted.sort(key=lambda r: r.score, reverse=True)
     return adjusted
-
-
-def _is_latin_letter(char: str) -> bool:
-    """Return whether an alphabetic character belongs to the Latin script."""
-    return char.isascii() or unicodedata.name(char, "").startswith("LATIN ")
 
 
 def _get_text(result: t.Any, field: str) -> str:

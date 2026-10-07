@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import re
 import typing as t
+import unicodedata
 
 import searx
 from searx.plugins import Plugin, PluginInfo  # ty: ignore[unresolved-import]
@@ -251,6 +252,7 @@ class SXNGPlugin(Plugin):
             return None
 
         try:
+            self._filter_results(query, results_map)
             self._rerank(query, results_map)
         except Exception:
             logger.exception("BM25 reranking failed, keeping original order")
@@ -260,6 +262,19 @@ class SXNGPlugin(Plugin):
         )
 
         return None
+
+    def _filter_results(self, query: str, results_map: dict) -> None:
+        """Remove mostly non-Latin results for queries containing ASCII Latin letters."""
+        if not re.search(r"[A-Za-z]", query):
+            return
+
+        for result_id, result in list(results_map.items()):
+            title = _get_text(result, "title")
+            description = _get_text(result, "description") or _get_text(result, "content")
+            text = f"{title} {description}"
+            letters = [char for char in text if char.isalpha()]
+            if letters and sum(not _is_latin_letter(char) for char in letters) / len(letters) >= 0.6:
+                del results_map[result_id]
 
     def _rerank(self, query: str, results_map: dict) -> None:
         """Core reranking logic.
@@ -428,6 +443,11 @@ def _apply_url_priority(
 
     adjusted.sort(key=lambda r: r.score, reverse=True)
     return adjusted
+
+
+def _is_latin_letter(char: str) -> bool:
+    """Return whether an alphabetic character belongs to the Latin script."""
+    return char.isascii() or unicodedata.name(char, "").startswith("LATIN ")
 
 
 def _get_text(result: t.Any, field: str) -> str:

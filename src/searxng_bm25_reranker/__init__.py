@@ -163,6 +163,31 @@ def _compute_lm_embedding_ranking(
 
 _SPACE_RE = re.compile(r"[ \t]+")
 
+# Query parameters that only exist to track traffic and do not change the
+# actual page content.  They are stripped during URL normalization so that
+# otherwise-identical links (e.g. sharing URLs from social networks) can be
+# detected as duplicates.
+_TRACKING_PARAMS = frozenset(
+    {
+        "fbclid",
+        "gclid",
+        "dclid",
+        "msclkid",
+        "mc_cid",
+        "mc_eid",
+        "igshid",
+        "ref",
+        "ref_src",
+        "source",
+        "utm_id",
+        "utm_source",
+        "utm_medium",
+        "utm_campaign",
+        "utm_term",
+        "utm_content",
+    }
+)
+
 
 def _url_host(url: str) -> str:
     """Extract the hostname from a URL, without scheme, path, or port."""
@@ -170,6 +195,59 @@ def _url_host(url: str) -> str:
         return urllib.parse.urlparse(url).hostname or ""
     except ValueError:
         return ""
+
+
+def _normalize_url(url: str, *, strip_tracking: bool = True) -> str:
+    """Normalize a URL so near-identical links can be deduplicated.
+
+    Lowercases the scheme and host, drops the fragment, and (optionally)
+    removes well-known tracking query parameters (``utm_*``, ``fbclid``,
+    ``gclid``, ...).  The path and any remaining query string are preserved.
+    A single trailing slash on the path is also removed so that
+    ``https://example.com/page/`` and ``https://example.com/page`` compare
+    equal.
+
+    Args:
+        url: Raw result URL.
+        strip_tracking: Remove known tracking query parameters.
+
+    Returns:
+        A canonical string used for duplicate detection.  Empty input or
+        unparseable URLs fall back to the raw value so they are never
+        collapsed by accident.
+    """
+    if not url:
+        return url
+    try:
+        parsed = urllib.parse.urlsplit(url)
+    except ValueError:
+        return url
+
+    scheme = parsed.scheme.lower()
+    host = (parsed.hostname or "").lower()
+
+    netloc = host
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    if port:
+        netloc = f"{netloc}:{port}"
+
+    if strip_tracking and parsed.query:
+        kept = [
+            (key, value)
+            for key, value in urllib.parse.parse_qsl(
+                parsed.query, keep_blank_values=True
+            )
+            if key.lower() not in _TRACKING_PARAMS
+        ]
+        query = urllib.parse.urlencode(kept)
+    else:
+        query = parsed.query
+
+    rebuilt = urllib.parse.urlunsplit((scheme, netloc, parsed.path, query, ""))
+    return rebuilt.rstrip("/") or rebuilt
 
 
 def _truncate_tokens(text: str, max_tokens: int = 512) -> str:
@@ -277,6 +355,40 @@ class SXNGPlugin(Plugin):
             if text and sum(not is_latin_character(char) for char in text) / len(text) > 0.6:
                 del results_map[result_id]
 
+    def _filter_duplicate_urls(self, results_map: dict) -> None:
+        """Remove results that share a URL with an earlier, better-ranked one.
+
+        Results are compared using :func:`_normalize_url` so that links
+        differing only by fragment, trailing slash, or tracking parameters
+        are treated as the same page.  For each normalized URL the first
+        (highest-ranked) occurrence is kept and later duplicates are
+        dropped.  Can be toggled and tuned via the plugin settings:
+
+        ``dedup_by_url`` (default ``True``) enables/disables the filter;
+        ``dedup_strip_tracking`` (default ``True``) controls whether
+        tracking query parameters are stripped before comparison.
+        """
+        cfg = searx.settings.get(self._settings_prefix, {})
+        if not bool(cfg.get("dedup_by_url", True)):
+            return
+        strip_tracking = bool(cfg.get("dedup_strip_tracking", True))
+
+        seen: dict[str, str] = {}  # normalized url -> kept result id
+        for result_id, result in list(results_map.items()):
+            url = _get_text(result, "url")
+            if not url:
+                continue
+            key = _normalize_url(url, strip_tracking=strip_tracking)
+            if not key:
+                continue
+            if key in seen:
+                logger.debug(
+                    "Dropping duplicate URL %r (kept %r)", url, seen[key]
+                )
+                del results_map[result_id]
+            else:
+                seen[key] = result_id
+
     def _rerank(self, query: str, results_map: dict) -> None:
         """Core reranking logic.
 
@@ -296,6 +408,11 @@ class SXNGPlugin(Plugin):
         for result_id, result in list(results_map.items()):
             if not _result_matches_query(result, query_words):
                 del results_map[result_id]
+
+        # Collapse duplicate URLs after the query-word filter so that, when
+        # two results share a URL, the one that matches the query text is
+        # never discarded in favour of an earlier non-matching twin.
+        self._filter_duplicate_urls(results_map)
 
         if len(results_map) < 2:
             return
@@ -376,13 +493,14 @@ class SXNGPlugin(Plugin):
             r["positions"] = [new_pos] * max(n_positions, 1)
 
         logger.debug(
-            "Reranked %d results (bm25_weight=%.2f, lm_weight=%.2f, url_priority=%d patterns, lm_date_boost=%s, lm_date_nerf=%s) for: %s",
+            "Reranked %d results (bm25_weight=%.2f, lm_weight=%.2f, url_priority=%d patterns, lm_date_boost=%s, lm_date_nerf=%s, dedup_by_url=%s) for: %s",
             len(fused),
             bm25_weight,
             lm_weight,
             len(url_priority),
             lm_date_boost,
             lm_date_nerf,
+            bool(cfg.get("dedup_by_url", True)),
             query[:50],
         )
 
